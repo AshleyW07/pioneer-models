@@ -16,6 +16,7 @@ import os
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from PIL import Image, ImageEnhance
 import math
+import time
 targetStyles = {
     'Baroque': 4,
     'Romanticism': 23,
@@ -47,7 +48,7 @@ feature_toggles = {
 }
 
 RANDOM_SEED = 42
-SAMPLES_PER_CLASS = 2000  # increased training input per class
+SAMPLES_PER_CLASS = 1200  # ensure ~840 train per class (70%), >=1000 total easily; tune as needed
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
@@ -386,16 +387,24 @@ xVal = xAll[len(trainData):len(trainData)+len(valData)]
 yVal = yAll[len(trainData):len(trainData)+len(valData)]
 xTest = xAll[len(trainData)+len(valData):]
 yTest = yAll[len(trainData)+len(valData):]
+trainFeatureMean = np.mean(xTrain, axis=0)
+trainFeatureStd = np.std(xTrain, axis=0) + 1e-8
 print("Normalizing features...")
 scaler = StandardScaler()
 xTrainScaled = scaler.fit_transform(xTrain)
 xValScaled = scaler.transform(xVal)
 xTestScaled = scaler.transform(xTest)
 print("\nTraining ML models...")
-rfModel = RandomForestClassifier(n_estimators=200, max_depth=15, random_state=42, n_jobs=-1)
+print("Fitting Random Forest...")
+rf_start = time.time()
+rfModel = RandomForestClassifier(n_estimators=200, max_depth=15, random_state=42, n_jobs=-1, verbose=1)
 rfModel.fit(xTrainScaled, yTrain)
-svmModel = SVC(kernel='rbf', C=10, gamma='scale', random_state=42)
+print(f"RF fit time: {time.time()-rf_start:.1f}s")
+print("Fitting SVM...")
+svm_start = time.time()
+svmModel = SVC(kernel='rbf', C=10, gamma='scale', random_state=42, verbose=True)
 svmModel.fit(xTrainScaled, yTrain)
+print(f"SVM fit time: {time.time()-svm_start:.1f}s")
 rfPreds = rfModel.predict(xTestScaled)
 svmPreds = svmModel.predict(xTestScaled)
 rfAcc = accuracy_score(yTest, rfPreds)
@@ -422,6 +431,16 @@ if bestName == "Random Forest":
     sortedImportance = sorted(groupImportance.items(), key=lambda x: x[1], reverse=True)
     for featGroup, importance in sortedImportance:
         print(f"{featGroup:>18}: {importance:.4f}")
+    # Top individual features
+    print("\nTop 10 individual features by importance:")
+    featImportance = rfModel.feature_importances_
+    top_idx = np.argsort(featImportance)[-10:][::-1]
+    idx_to_group = {}
+    for groupName, (start, end) in group_indices.items():
+        for i in range(start, end):
+            idx_to_group[i] = groupName
+    for rank, idx in enumerate(top_idx, 1):
+        print(f"{rank:2d}. idx {idx:4d} [{idx_to_group.get(idx, 'Unknown')}]: {featImportance[idx]:.5f}")
 
 plt.figure(figsize=(12, 4))
 plt.subplot(1, 2, 1)
@@ -462,6 +481,128 @@ disp_test.plot(ax=axes[1], cmap='Greens', colorbar=False, xticks_rotation=45)
 axes[1].set_title('Test Confusion Matrix')
 plt.tight_layout()
 plt.show()
+
+# Per-image explanations for Random Forest using SHAP (if available)
+def build_feature_name_list():
+    names = []
+    # Color Histogram (HSV 8 bins)
+    if feature_toggles['color_hist']:
+        channels = ['H', 'S', 'V']
+        for ch in channels:
+            for b in range(8):
+                lo = b/8.0
+                hi = (b+1)/8.0
+                names.append(f"HSV-{ch} hist bin {b} [{lo:.2f}-{hi:.2f}]")
+    # Color Stats
+    if feature_toggles['color_stats']:
+        channels = ['H', 'S', 'V']
+        stats = ['mean', 'var', 'skew', 'kurt']
+        for ch in channels:
+            for st in stats:
+                names.append(f"HSV-{ch} {st}")
+    # Edge Texture (Canny edge ratios at thresholds)
+    if feature_toggles['edge_texture']:
+        thresholds = [0.2, 0.3, 0.4, 0.6]
+        for t in thresholds:
+            names.append(f"Canny edge ratio @{t}")
+    # LBP
+    if feature_toggles['lbp']:
+        for k in range(26):
+            names.append(f"LBP uniform bin {k}")
+    # GLCM
+    if feature_toggles['glcm']:
+        distances = [1, 3]
+        angles_deg = [0, 45, 90, 135]
+        props = ['contrast', 'homogeneity', 'energy']
+        for p in props:
+            for d in distances:
+                for a in angles_deg:
+                    names.append(f"GLCM {p} d={d} a={a}°")
+    # Texture Energy
+    if feature_toggles['texture_energy']:
+        names.extend([
+            'GradMag mean', 'GradMag std', 'abs(gradX) mean', 'abs(gradY) mean'
+        ])
+    # GIST (4x4 blocks x 4 orientations)
+    if feature_toggles['gist']:
+        orientations = ['0°', '45°', '90°', '135°']
+        for i in range(4):
+            for j in range(4):
+                for o in orientations:
+                    names.append(f"GIST block({i},{j}) {o}")
+    # ORB
+    if feature_toggles['orb']:
+        names.extend([
+            'ORB num_kp', 'ORB response mean', 'ORB response std',
+            'ORB size mean', 'ORB size std', 'ORB angle cos', 'ORB angle sin'
+        ])
+        for i in range(32):
+            names.append(f"ORB desc_mean[{i}]")
+        for i in range(32):
+            names.append(f"ORB desc_std[{i}]")
+    return names
+
+def _format_feature_explanation(name: str, value: float, zscore: float, contribution: float) -> str:
+    trend = "high" if zscore > 0.8 else ("low" if zscore < -0.8 else "typical")
+    sign = "supports" if contribution > 0 else "opposes"
+    if name.startswith("HSV-") and "hist bin" in name:
+        return f"{trend} presence in {name.split(' ')[0]} {name.split('hist')[0].strip().split('-')[1]} range ({name.split('[')[1][:-1]}), {sign} class"
+    if name.startswith("HSV-") and any(s in name for s in ["mean","var","skew","kurt"]):
+        return f"{trend} {name}, {sign} class"
+    if name.startswith("Canny edge ratio"):
+        return f"{trend} edge density {name.split('@')[1]}, {sign} class"
+    if name.startswith("LBP uniform bin"):
+        return f"{trend} local texture pattern {name}, {sign} class"
+    if name.startswith("GLCM"):
+        return f"{trend} {name} (co-occurrence texture), {sign} class"
+    if name in [
+        'GradMag mean', 'GradMag std', 'abs(gradX) mean', 'abs(gradY) mean']:
+        return f"{trend} gradient {name}, {sign} class"
+    if name.startswith("GIST block"):
+        return f"{trend} spatial response {name}, {sign} class"
+    if name.startswith("ORB "):
+        return f"{trend} keypoint/descriptor stat {name}, {sign} class"
+    return f"{trend} {name}, {sign} class"
+
+def explain_per_image_random_forest(model, x_scaled, x_raw, class_names, feat_mean, feat_std, top_k=5, sample_count=6):
+    try:
+        import shap
+    except Exception as e:
+        print("SHAP not available; to enable per-image explanations, install it: pip install shap")
+        return
+    print("\nPer-image explanations (Random Forest):")
+    np.random.seed(RANDOM_SEED)
+    idxs = np.random.choice(len(x_scaled), size=min(sample_count, len(x_scaled)), replace=False)
+    explainer = shap.TreeExplainer(model)
+    # shap_values is a list (one array per class): [n_classes x (n_samples, n_features)]
+    shap_values = explainer.shap_values(x_scaled[idxs])
+    feature_names = build_feature_name_list()
+    for k, idx in enumerate(idxs):
+        x_row_scaled = x_scaled[idx:idx+1]
+        x_row_raw = x_raw[idx]
+        pred = model.predict(x_row_scaled)[0]
+        contrib = shap_values[pred][k] if isinstance(shap_values, list) else shap_values[k]
+        # sort by absolute contribution
+        order = np.argsort(np.abs(contrib))[::-1][:top_k]
+        print(f"\nSample {k+1}: predicted -> {class_names[pred]}")
+        simple_bullets = []
+        for rank, fi in enumerate(order, 1):
+            fname = feature_names[fi] if fi < len(feature_names) else f"feature[{fi}]"
+            z = (x_row_raw[fi] - feat_mean[fi]) / feat_std[fi]
+            phrase = _format_feature_explanation(fname, float(x_row_raw[fi]), float(z), float(contrib[fi]))
+            print(f"  {rank}. {fname}: value={x_row_raw[fi]:.4f}, z={z:+.2f}, contribution={contrib[fi]:+.4f} -> {phrase}")
+            # Store simplified bullet for narrative
+            simple_bullets.append(phrase)
+        print("  Note: positive contribution moves towards predicted class.")
+        # Layperson-friendly narrative
+        print("  In plain language: ")
+        for b in simple_bullets:
+            print(f"   - {b}.")
+        print(f"   - Overall, these cues collectively suggest the painting resembles {class_names[pred]}.")
+
+# Always run per-image explanations using Random Forest (for interpretability)
+# Use validation set to avoid test leakage in metrics
+explain_per_image_random_forest(rfModel, xValScaled, xVal, styleNames, trainFeatureMean, trainFeatureStd, top_k=6, sample_count=6)
 
 def showExamples(testData, xTestScaled, bestModel, numSamples=6):
     indices = random.sample(range(len(testData)), numSamples)
