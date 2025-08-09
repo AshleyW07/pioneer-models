@@ -137,7 +137,7 @@ def extractColorStats(img):
         chData = hsvImg[:,:,ch].flatten()
         mean = np.mean(chData)
         variance = np.var(chData)
-        std = np.sqrt(variance)
+        std = np.sqrt(variance) + 1e-8
         features.append(mean)
         features.append(variance)
         # Skewness& kurtosis
@@ -307,6 +307,15 @@ def extractAllFeatures(imgPath):
         feats.extend(extractGIST(img))
     if feature_toggles['orb']:
         feats.extend(extractORBFeatures(img))
+    # Enforce fixed length
+    exp_len = expected_feature_dim()
+    cur_len = len(feats)
+    if cur_len != exp_len:
+        print(f"Warning: feature length {cur_len} != expected {exp_len} for {os.path.basename(imgPath)}; auto {'padding' if cur_len < exp_len else 'truncating'}.")
+        if cur_len < exp_len:
+            feats.extend([0.0] * (exp_len - cur_len))
+        else:
+            feats = feats[:exp_len]
     return np.array(feats, dtype=np.float32)
 
 def augment_image(pil_img):
