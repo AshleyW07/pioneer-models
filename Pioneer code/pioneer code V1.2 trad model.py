@@ -13,6 +13,9 @@ from skimage.color import rgb2gray, rgb2hsv
 import random
 from PIL import Image
 import os
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from PIL import Image, ImageEnhance
+import math
 targetStyles = {
     'Baroque': 4,
     'Romanticism': 23,
@@ -21,6 +24,32 @@ targetStyles = {
     'Post_Impressionism': 20,
     'Expressionism': 9
 }
+
+auger_config = {
+    'do_augment': True,
+    'augmentations_per_image': 1,          # increase to expand training set size
+    'max_rotation_deg': 20,                # do not rotate beyond this absolute value
+    'allow_horizontal_flip': True,         # horizontal flips only
+    'allow_vertical_flip': False,          # keep paintings upright
+    'brightness_jitter': 0.15,             # +/- 15%
+    'contrast_jitter': 0.15                # +/- 15%
+}
+
+feature_toggles = {
+    'color_hist': True,
+    'color_stats': True,
+    'edge_texture': True,
+    'lbp': True,
+    'glcm': True,
+    'texture_energy': True,
+    'gist': True,
+    'orb': True
+}
+
+RANDOM_SEED = 42
+SAMPLES_PER_CLASS = 2000  # increased training input per class
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
 
 def loadData(samplesPerClass=1500):
     print("Loading WikiArt dataset...")
@@ -132,6 +161,85 @@ def extractEdgeTexture(img):
         features.append(edgeRatio)
     return features
 
+def extractGLCM(img):
+    gray_img = rgb2gray(img)
+    # Quantize to 16 gray levels
+    q = np.clip((gray_img * 16).astype(np.uint8), 0, 15)
+    distances = [1, 3]
+    angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
+    glcm = graycomatrix(q, distances=distances, angles=angles, levels=16, symmetric=True, normed=True)
+    props = ['contrast', 'homogeneity', 'energy']
+    feats = []
+    for p in props:
+        vals = graycoprops(glcm, prop=p)  # shape (len(distances), len(angles))
+        feats.extend(vals.flatten().tolist())
+    return feats  # 2 distances x 4 angles x 3 props = 24 dims
+
+def extractORBFeatures(img):
+    gray_img = rgb2gray(img)
+    gray_uint8 = (gray_img * 255).astype(np.uint8)
+    orb = cv2.ORB_create(nfeatures=500)
+    keypoints, descriptors = orb.detectAndCompute(gray_uint8, None)
+    num_kp = 0 if keypoints is None else len(keypoints)
+    if num_kp == 0 or descriptors is None:
+        # 69-dim zero vector placeholder
+        return [0.0] * 69
+    responses = np.array([kp.response for kp in keypoints], dtype=np.float32)
+    sizes = np.array([kp.size for kp in keypoints], dtype=np.float32)
+    angles = np.array([kp.angle for kp in keypoints if kp.angle >= 0], dtype=np.float32)
+    # If some angles are -1 (unknown), handle gracefully
+    if angles.size == 0:
+        mean_cos, mean_sin = 0.0, 0.0
+    else:
+        radians = np.deg2rad(angles)
+        mean_cos = float(np.mean(np.cos(radians)))
+        mean_sin = float(np.mean(np.sin(radians)))
+    # Descriptor stats (uint8, shape [N, 32])
+    desc = descriptors.astype(np.float32) / 255.0
+    desc_mean = np.mean(desc, axis=0).tolist()          # 32
+    desc_std = np.std(desc, axis=0).tolist()            # 32
+    feats = [
+        float(num_kp),
+        float(np.mean(responses)), float(np.std(responses)),
+        float(np.mean(sizes)), float(np.std(sizes)),
+        mean_cos, mean_sin
+    ]
+    feats.extend(desc_mean)
+    feats.extend(desc_std)
+    return feats  # total 69 dims
+
+def get_feature_group_lengths():
+    lengths = {}
+    if feature_toggles['color_hist']:
+        lengths['Color Histogram'] = 24
+    if feature_toggles['color_stats']:
+        lengths['Color Statistics'] = 12
+    if feature_toggles['edge_texture']:
+        lengths['Edge Texture'] = 4
+    if feature_toggles['lbp']:
+        lengths['LBP Texture'] = 26
+    if feature_toggles['glcm']:
+        lengths['GLCM Texture'] = 24
+    if feature_toggles['texture_energy']:
+        lengths['Texture Energy'] = 4
+    if feature_toggles['gist']:
+        lengths['GIST Spatial'] = 64
+    if feature_toggles['orb']:
+        lengths['ORB Keypoints'] = 69
+    return lengths
+
+def get_feature_group_indices():
+    lengths = get_feature_group_lengths()
+    indices = {}
+    start = 0
+    for name, length in lengths.items():
+        indices[name] = (start, start + length)
+        start += length
+    return indices
+
+def expected_feature_dim():
+    return sum(get_feature_group_lengths().values())
+
 def extractLBP(img):
     grayImg = rgb2gray(img)
     radius = 3
@@ -181,18 +289,80 @@ def extractTextureEnergy(img):
 def extractAllFeatures(imgPath):
     img = np.array(Image.open(imgPath).convert('RGB'))
     img = img / 255.0
-    allFeatures = []
-    allFeatures.extend(extractColorHist(img))      #24 features (8binsx3channels)
-    allFeatures.extend(extractColorStats(img))     #12 features (4 statsx3 channels)
-    allFeatures.extend(extractEdgeTexture(img))    #4 features
-    allFeatures.extend(extractLBP(img))        #26 features
-    allFeatures.extend(extractTextureEnergy(img))   #4 features
-    allFeatures.extend(extractGIST(img))        #64 features (4×4 gridx4 orientations)
-    return np.array(allFeatures)
+    feats = []
+    if feature_toggles['color_hist']:
+        feats.extend(extractColorHist(img))
+    if feature_toggles['color_stats']:
+        feats.extend(extractColorStats(img))
+    if feature_toggles['edge_texture']:
+        feats.extend(extractEdgeTexture(img))
+    if feature_toggles['lbp']:
+        feats.extend(extractLBP(img))
+    if feature_toggles['glcm']:
+        feats.extend(extractGLCM(img))
+    if feature_toggles['texture_energy']:
+        feats.extend(extractTextureEnergy(img))
+    if feature_toggles['gist']:
+        feats.extend(extractGIST(img))
+    if feature_toggles['orb']:
+        feats.extend(extractORBFeatures(img))
+    return np.array(feats, dtype=np.float32)
 
-allData = loadData(samplesPerClass=1500)
+def augment_image(pil_img):
+    img = pil_img
+    # Rotation (bounded)
+    max_deg = max(0, int(auger_config['max_rotation_deg']))
+    if max_deg > 0:
+        deg = random.uniform(-max_deg, max_deg)
+        img = img.rotate(deg, resample=Image.BILINEAR, expand=True, fillcolor=(int(255*0.5),)*3)
+        img = img.resize((256, 256), Image.LANCZOS)
+    # Horizontal flip only
+    if auger_config['allow_horizontal_flip'] and random.random() < 0.5:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    # Vertical flip not allowed by default
+    if auger_config['allow_vertical_flip'] and random.random() < 0.1:
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    # Brightness/Contrast jitter
+    if auger_config['brightness_jitter'] > 0:
+        b = 1.0 + random.uniform(-auger_config['brightness_jitter'], auger_config['brightness_jitter'])
+        img = ImageEnhance.Brightness(img).enhance(b)
+    if auger_config['contrast_jitter'] > 0:
+        c = 1.0 + random.uniform(-auger_config['contrast_jitter'], auger_config['contrast_jitter'])
+        img = ImageEnhance.Contrast(img).enhance(c)
+    return img
+
+def augment_training_set(train_items):
+    if not auger_config['do_augment'] or auger_config['augmentations_per_image'] <= 0:
+        return []
+    os.makedirs('/tmp/art_cache_traditional/aug', exist_ok=True)
+    augmented = []
+    for item in train_items:
+        src_path = item['imgPath']
+        try:
+            base_img = Image.open(src_path).convert('RGB')
+        except Exception:
+            continue
+        for k in range(auger_config['augmentations_per_image']):
+            aug_img = augment_image(base_img)
+            aug_path = src_path.replace('/tmp/art_cache_traditional/', '/tmp/art_cache_traditional/aug/')
+            base_name = os.path.splitext(os.path.basename(aug_path))[0]
+            save_path = f"/tmp/art_cache_traditional/aug/{base_name}_aug{k}.png"
+            aug_img.save(save_path, 'PNG')
+            augmented.append({
+                'imgPath': save_path,
+                'style': item['style'],
+                'styleId': item['styleId']
+            })
+    print(f"Augmented training samples added: {len(augmented)}")
+    return augmented
+
+allData = loadData(samplesPerClass=SAMPLES_PER_CLASS)
 trainData, valData, testData = splitData(allData)
 print(f"Train: {len(trainData)}, Val: {len(valData)}, Test: {len(testData)}")
+augmented = augment_training_set(trainData)
+if augmented:
+    trainData = trainData + augmented
+    print(f"After augmentation -> Train: {len(trainData)}")
 print("\nExtracting traditional CV features...")
 allDataCombined = trainData + valData + testData
 xAll = []
@@ -207,7 +377,7 @@ for i, item in enumerate(allDataCombined):
 
 xAll = np.array(xAll)
 yAll = np.array(yAll)
-print(f"Feature vector size: {xAll.shape[1]} dimensions")
+print(f"Feature vector size: {xAll.shape[1]} dimensions (expected {expected_feature_dim()})")
 xAll = np.nan_to_num(xAll, nan=0.0, posinf=1.0, neginf=-1.0)
 
 xTrain = xAll[:len(trainData)]
@@ -245,21 +415,14 @@ print(classification_report(yTest, bestPreds, target_names=styleNames, digits=3)
 if bestName == "Random Forest":
     print("\nFeature Importance Analysis:")
     featImportance = rfModel.feature_importances_
-    featGroups = {
-        'Color Histogram': (0, 24),
-        'Color Statistics': (24, 36),
-        'Edge Texture': (36, 40),
-        'LBP Texture': (40, 66),
-        'GLCM Texture': (66, 90),
-        'Texture Energy': (90, 94),
-        'GIST Spatial': (94, 158)
-    }
+    group_indices = get_feature_group_indices()
     groupImportance = {}
-    for groupName, (start, end) in featGroups.items():
-        groupImportance[groupName] = np.mean(featImportance[start:end])
+    for groupName, (start, end) in group_indices.items():
+        groupImportance[groupName] = float(np.mean(featImportance[start:end]))
     sortedImportance = sorted(groupImportance.items(), key=lambda x: x[1], reverse=True)
     for featGroup, importance in sortedImportance:
-        print(f"{featGroup:>15}: {importance:.4f}")
+        print(f"{featGroup:>18}: {importance:.4f}")
+
 plt.figure(figsize=(12, 4))
 plt.subplot(1, 2, 1)
 models = ['Random Forest', 'SVM']
@@ -281,6 +444,25 @@ if bestName == "Random Forest" and 'sortedImportance' in locals():
     plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
+
+# Confusion matrices for validation and test
+print("\nConfusion Matrices:")
+valPreds_rf = rfModel.predict(xValScaled)
+valPreds_svm = svmModel.predict(xValScaled)
+val_best = valPreds_rf if bestName == 'Random Forest' else valPreds_svm
+test_best = bestPreds
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+cm_val = confusion_matrix(yVal, val_best)
+disp_val = ConfusionMatrixDisplay(confusion_matrix=cm_val, display_labels=styleNames)
+disp_val.plot(ax=axes[0], cmap='Blues', colorbar=False, xticks_rotation=45)
+axes[0].set_title('Validation Confusion Matrix')
+cm_test = confusion_matrix(yTest, test_best)
+disp_test = ConfusionMatrixDisplay(confusion_matrix=cm_test, display_labels=styleNames)
+disp_test.plot(ax=axes[1], cmap='Greens', colorbar=False, xticks_rotation=45)
+axes[1].set_title('Test Confusion Matrix')
+plt.tight_layout()
+plt.show()
+
 def showExamples(testData, xTestScaled, bestModel, numSamples=6):
     indices = random.sample(range(len(testData)), numSamples)
     classNames = list(targetStyles.keys())
