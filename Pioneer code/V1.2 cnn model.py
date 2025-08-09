@@ -44,7 +44,7 @@ save_checkpoint_every_n_epochs = 5
 early_stopping_patience = 7          # None or integer epochs without val improvement
 
 # Model controls
-backbone_name = 'resnet18'           # options: resnet18/34/50, densenet121, vgg16, efficientnet_b0
+backbone_name = 'resnet18'           # options: resnet18/34/50, densenet121, vgg16, efficientnet_b0, custom_cnn
 use_pretrained_backbone = True
 classifier_hidden_dims = [512, 256]  # can try smaller: [256, 128] or single [256]
 classifier_dropout_p = 0.5
@@ -207,8 +207,63 @@ def create_model(backbone: str, num_classes: int, pretrained: bool = True,
     if hidden_dims is None:
         hidden_dims = [512, 256]
 
+    # -----------------
+    # Custom small CNN
+    # -----------------
+    def initialize_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.BatchNorm2d):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Linear):
+            nn.init.xavier_normal_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    class SmallCNN(nn.Module):
+        def __init__(self, num_classes: int, head_hidden_dims, head_dropout: float):
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=2),  # 112x112
+
+                nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=2),  # 56x56
+
+                nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=2),  # 28x28
+            )
+            self.gap = nn.AdaptiveAvgPool2d((1, 1))
+            classifier_layers = []
+            prev_dim = 128
+            for dim in head_hidden_dims:
+                classifier_layers.extend([nn.Linear(prev_dim, dim), nn.ReLU(), nn.Dropout(head_dropout)])
+                prev_dim = dim
+            classifier_layers.append(nn.Linear(prev_dim, num_classes))
+            self.classifier = nn.Sequential(*classifier_layers)
+            self.apply(initialize_weights)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.features(x)
+            x = self.gap(x)
+            x = torch.flatten(x, 1)
+            x = self.classifier(x)
+            return x
+
     # Instantiate backbone
-    if backbone == 'resnet18':
+    if backbone == 'custom_cnn':
+        model = SmallCNN(num_classes=num_classes, head_hidden_dims=hidden_dims, head_dropout=dropout_p)
+        return model
+    elif backbone == 'resnet18':
         model = models.resnet18(pretrained=pretrained)
         numFeatures = model.fc.in_features
         classifier_in_dim = numFeatures
