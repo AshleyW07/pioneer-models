@@ -27,7 +27,7 @@ targetStyles = {
 }
 
 auger_config = {
-    'do_augment': True,
+    'do_augment': False,
     'augmentations_per_image': 1,          # increase to expand training set size
     'max_rotation_deg': 20,                # do not rotate beyond this absolute value
     'allow_horizontal_flip': True,         # horizontal flips only
@@ -48,7 +48,7 @@ feature_toggles = {
 }
 
 RANDOM_SEED = 42
-SAMPLES_PER_CLASS = 1200  # ensure ~840 train per class (70%), >=1000 total easily; tune as needed
+SAMPLES_PER_CLASS = 500  # quick test size per class
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
